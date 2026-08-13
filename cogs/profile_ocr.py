@@ -164,7 +164,9 @@ class ProfileOCR(commands.Cog):
             ).fetchone()
 
         if row is None:
-            return "not_found", False
+            return "not_found", False, None
+
+        old_nickname, old_kid = row
 
         changed = apply_member_edit(
             fid,
@@ -174,9 +176,15 @@ class ProfileOCR(commands.Cog):
         )
 
         if changed:
-            return "updated", ("state" in changed)
+            details = {
+                "old_name": old_nickname,
+                "new_name": nickname,
+                "old_kingdom": old_kid,
+                "new_kingdom": kid,
+            }
+            return "updated", ("state" in changed), details
 
-        return "unchanged", False
+        return "unchanged", False, None
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -229,6 +237,10 @@ class ProfileOCR(commands.Cog):
                 db_not_found = 0
                 state_fids = []
 
+                db_updated_profiles = []
+                db_unchanged_profiles = []
+                db_not_found_profiles = []
+
                 for image in images:
                     try:
                         logger.warning("ProfileOCR DEBUG: reading image %s", image.filename)
@@ -255,21 +267,59 @@ class ProfileOCR(commands.Cog):
                             and profile["kingdom"] != "Unbekannt"
                         ):
                             try:
-                                sync_status, state_changed = (
+                                sync_status, state_changed, change_details = (
                                     await asyncio.to_thread(
                                         self._sync_existing_member,
                                         profile,
                                     )
                                 )
 
+                                profile_label = (
+                                    f"{profile['id']} — {profile['name']}"
+                                )
+
                                 if sync_status == "updated":
                                     db_updated += 1
 
+                                    change_lines = [
+                                        f"{profile['id']}"
+                                    ]
+
+                                    if (
+                                        change_details
+                                        and change_details["old_name"]
+                                        != change_details["new_name"]
+                                    ):
+                                        change_lines.append(
+                                            "Name: "
+                                            f"{change_details['old_name']} "
+                                            "→ "
+                                            f"{change_details['new_name']}"
+                                        )
+
+                                    if (
+                                        change_details
+                                        and change_details["old_kingdom"]
+                                        != change_details["new_kingdom"]
+                                    ):
+                                        change_lines.append(
+                                            "Kingdom: "
+                                            f"{change_details['old_kingdom']} "
+                                            "→ "
+                                            f"{change_details['new_kingdom']}"
+                                        )
+
+                                    db_updated_profiles.append(
+                                        " | ".join(change_lines)
+                                    )
+
                                 elif sync_status == "unchanged":
                                     db_unchanged += 1
+                                    db_unchanged_profiles.append(profile_label)
 
                                 elif sync_status == "not_found":
                                     db_not_found += 1
+                                    db_not_found_profiles.append(profile_label)
 
                                 if state_changed:
                                     state_fids.append(
@@ -317,12 +367,30 @@ class ProfileOCR(commands.Cog):
                         + "\n```"
                     )
 
-                    db_text = (
-                        "💾 **Mitgliederdatenbank**\n"
-                        f"🔄 Aktualisiert: **{db_updated}**\n"
-                        f"➖ Unverändert: **{db_unchanged}**\n"
+                    db_lines = [
+                        "💾 **Mitgliederdatenbank**",
+                        f"🔄 Aktualisiert: **{db_updated}**",
+                    ]
+
+                    db_lines.extend(
+                        f"  • {x}" for x in db_updated_profiles
+                    )
+
+                    db_lines.append(
+                        f"➖ Unverändert: **{db_unchanged}**"
+                    )
+                    db_lines.extend(
+                        f"  • {x}" for x in db_unchanged_profiles
+                    )
+
+                    db_lines.append(
                         f"❓ Nicht vorhanden: **{db_not_found}**"
                     )
+                    db_lines.extend(
+                        f"  • {x}" for x in db_not_found_profiles
+                    )
+
+                    db_text = "\n".join(db_lines)
 
                     if caught:
                         db_text += (
