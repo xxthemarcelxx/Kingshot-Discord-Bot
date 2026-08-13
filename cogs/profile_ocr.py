@@ -164,7 +164,33 @@ class ProfileOCR(commands.Cog):
             ).fetchone()
 
         if row is None:
-            return "not_found", False, None
+            # Governor wurde sicher erkannt, existiert aber noch nicht.
+            # Nur die Daten eintragen, die direkt aus dem Profil stammen.
+            # Die Alliance wird später manuell zugewiesen.
+            with sqlite3.connect(
+                "db/users.sqlite",
+                timeout=30.0,
+            ) as conn:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO users (
+                            fid,
+                            nickname,
+                            furnace_lv,
+                            kid,
+                            alliance
+                        )
+                        VALUES (?, ?, 0, ?, NULL)
+                        """,
+                        (fid, nickname, kid),
+                    )
+                    conn.commit()
+                    return "added", False, None
+                except sqlite3.IntegrityError:
+                    # Falls die ID zwischen SELECT und INSERT von einem
+                    # anderen Prozess angelegt wurde, nicht überschreiben.
+                    return "unchanged", False, None
 
         old_nickname, old_kid = row
 
@@ -234,12 +260,12 @@ class ProfileOCR(commands.Cog):
 
                 db_updated = 0
                 db_unchanged = 0
-                db_not_found = 0
+                db_added = 0
                 state_fids = []
 
                 db_updated_profiles = []
                 db_unchanged_profiles = []
-                db_not_found_profiles = []
+                db_added_profiles = []
 
                 for image in images:
                     try:
@@ -317,9 +343,9 @@ class ProfileOCR(commands.Cog):
                                     db_unchanged += 1
                                     db_unchanged_profiles.append(profile_label)
 
-                                elif sync_status == "not_found":
-                                    db_not_found += 1
-                                    db_not_found_profiles.append(profile_label)
+                                elif sync_status == "added":
+                                    db_added += 1
+                                    db_added_profiles.append(profile_label)
 
                                 if state_changed:
                                     state_fids.append(
@@ -384,10 +410,10 @@ class ProfileOCR(commands.Cog):
                     )
 
                     db_lines.append(
-                        f"❓ Nicht vorhanden: **{db_not_found}**"
+                        f"➕ Neu hinzugefügt: **{db_added}**"
                     )
                     db_lines.extend(
-                        f"  • {x}" for x in db_not_found_profiles
+                        f"  • {x}" for x in db_added_profiles
                     )
 
                     db_text = "\n".join(db_lines)
