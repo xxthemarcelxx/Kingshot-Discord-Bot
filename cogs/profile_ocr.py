@@ -1,68 +1,95 @@
+"""
+Kingshot Governor Profile OCR
+
+Liest Governor-Profile aus Screenshots und erzeugt, also hoffentlich xD
+
+    ID,Name,Alliance,Kingdom
+
+Beispiel:
+
+    129255884,Newlifeyv13,PAX,856
+
+Phase 1:
+    Nur OCR + Erkennung.
+    Keine Änderung an users.sqlite.
+"""
+
+import logging
+import os
+import re
+import sqlite3
+
 import discord
 from discord.ext import commands
 from discord import app_commands
-import re
-import os
-import sqlite3
-import logging
 
 from . import bear_track
+
 
 logger = logging.getLogger("bot")
 
 
 class ProfileOCR(commands.Cog):
-    """
-    Erkennt Kingshot-Governor-Profile aus Screenshots.
-
-    Erwartetes Format:
-        ID,Name,Alliance,Kingdom
-
-    Beispiel:
-        129255884,Newlifeyv13,PAX,856
-    """
 
     def __init__(self, bot):
         self.bot = bot
 
-        # ID: 129255884
-        self.id_pattern = re.compile(
-            r"\bID\s*[:=-]?\s*(\d{7,10})\b",
-            re.IGNORECASE
-        )
-
-        # Kingdom: #856
-        self.kingdom_pattern = re.compile(
-            r"\bKingdom\s*[:=-]?\s*#?\s*(\d{1,6})\b",
-            re.IGNORECASE
-        )
-
-        # Alliance: PAX
-        # Etwas toleranter gegenüber OCR-Fehlern:
-        # Alliance / Alllance / Alli ance etc.
-        self.alliance_pattern = re.compile(
-            r"\bAll[i1l]{1,2}ance\s*[:=-]?\s*(.+?)(?=\s+\b(?:Kingdom|ID|Kills|Power)\b|$)",
-            re.IGNORECASE
-        )
-
-        # [PAX]Newlifeyv13
-        self.tag_pattern = re.compile(
-            r"^\s*\[[^\]]{1,10}\]\s*"
-        )
-
         self.log_file_path = "profiles_log.txt"
 
-        if not os.path.exists(self.log_file_path):
-            with open(self.log_file_path, "w", encoding="utf-8") as f:
-                f.write("ID,Name,Alliance,Kingdom\n")
+        # ---------------------------------------------------------
+        # Regex
+        # ---------------------------------------------------------
 
-    # ---------------------------------------------------------
-    # CHANNEL CONFIG
-    # ---------------------------------------------------------
+        self.id_pattern = re.compile(
+            r"\bID\s*[:=-]?\s*(\d{7,10})\b",
+            re.IGNORECASE,
+        )
+
+        self.kingdom_pattern = re.compile(
+            r"\bKingdom\s*[:=-]?\s*#?\s*(\d{1,6})\b",
+            re.IGNORECASE,
+        )
+
+        self.alliance_pattern = re.compile(
+            r"\bAlliance\s*[:=-]?\s*"
+            r"(.+?)"
+            r"(?=\s+\b(?:Kingdom|ID|Kills|Power)\b|$)",
+            re.IGNORECASE,
+        )
+
+        self.profile_name_pattern = re.compile(
+            r"^\s*\[([^\]]{1,20})\]\s*(.+?)\s*$"
+        )
+
+        # ---------------------------------------------------------
+        # Logdatei
+        # ---------------------------------------------------------
+
+        if not os.path.exists(self.log_file_path):
+
+            with open(
+                self.log_file_path,
+                "w",
+                encoding="utf-8",
+            ) as f:
+
+                f.write(
+                    "ID,Name,Alliance,Kingdom\n"
+                )
+
+    # =============================================================
+    # CHANNEL
+    # =============================================================
 
     def get_configured_channel_id(self):
+
         try:
-            with sqlite3.connect("db/settings.sqlite") as conn:
+
+            with sqlite3.connect(
+                "db/settings.sqlite",
+                timeout=10,
+            ) as conn:
+
                 row = conn.execute(
                     """
                     SELECT channel_id
@@ -75,26 +102,40 @@ class ProfileOCR(commands.Cog):
             return row[0] if row else None
 
         except Exception as e:
+
             logger.warning(
-                f"ProfileOCR: could not read OCR channel: {e}"
+                f"ProfileOCR: channel lookup failed: {e}"
             )
+
             return None
 
     @app_commands.command(
         name="set_profile_channel",
-        description="Legt den Kanal für automatische Profil-Screenshot-Analysen fest."
+        description=(
+            "Legt den Kanal für Governor-Profil-Screenshots fest."
+        ),
     )
-    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.checks.has_permissions(
+        administrator=True
+    )
     async def set_profile_channel(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel
+        channel: discord.TextChannel,
     ):
+
         try:
-            with sqlite3.connect("db/settings.sqlite") as conn:
+
+            with sqlite3.connect(
+                "db/settings.sqlite",
+                timeout=10,
+            ) as conn:
 
                 conn.execute(
-                    "DELETE FROM ocr_channel_settings WHERE alliance_id = 9999"
+                    """
+                    DELETE FROM ocr_channel_settings
+                    WHERE alliance_id = 9999
+                    """
                 )
 
                 conn.execute(
@@ -107,168 +148,219 @@ class ProfileOCR(commands.Cog):
                     )
                     VALUES (?, 9999, 0)
                     """,
-                    (channel.id,)
+                    (channel.id,),
                 )
 
                 conn.commit()
 
             await interaction.response.send_message(
-                f"📑 **Profil-OCR aktiviert für:** {channel.mention}",
-                ephemeral=True
+                (
+                    "📑 **Governor-Profil-OCR aktiviert**\n"
+                    f"Kanal: {channel.mention}"
+                ),
+                ephemeral=True,
             )
 
         except Exception as e:
-            logger.exception("ProfileOCR: failed to configure channel")
 
-            await interaction.response.send_message(
-                f"❌ Fehler beim Konfigurieren: `{e}`",
-                ephemeral=True
+            logger.exception(
+                "ProfileOCR: failed to configure channel"
             )
 
-    # ---------------------------------------------------------
-    # PROFILE PARSER
-    # ---------------------------------------------------------
+            await interaction.response.send_message(
+                f"❌ Fehler: `{e}`",
+                ephemeral=True,
+            )
 
-    def parse_profile(self, text: str):
-        """
-        Parsed OCR text into:
+    # =============================================================
+    # TEXT NORMALIZATION
+    # =============================================================
 
-            {
-                "id": "...",
-                "name": "...",
-                "alliance": "...",
-                "kingdom": "..."
-            }
-
-        """
+    @staticmethod
+    def normalize_text(text: str) -> str:
 
         if not text:
-            return None
+            return ""
 
-        # OCR-Zahlen reparieren.
+        # OCR-Digit-Reparatur aus dem bestehenden OCR-System
         try:
             text = bear_track.repair_ocr_digits(text)
         except Exception:
             pass
 
+        # Unicode whitespace vereinheitlichen
+        text = text.replace("\u00a0", " ")
+
+        text = re.sub(
+            r"[ \t]+",
+            " ",
+            text,
+        )
+
+        return text.strip()
+
+    # =============================================================
+    # PROFILE PARSER
+    # =============================================================
+
+    def parse_profile(self, text: str):
+
+        text = self.normalize_text(text)
+
+        if not text:
+            return None
+
+        # ---------------------------------------------------------
+        # OCR liefert aktuell einen zusammenhängenden Text.
+        # Wir versuchen trotzdem Zeilenstruktur zu erhalten,
+        # falls ein externer OCR-Dienst Zeilen liefert.
+        # ---------------------------------------------------------
+
         lines = [
-            re.sub(r"\s+", " ", line).strip()
-            for line in text.splitlines()
+            line.strip()
+            for line in re.split(
+                r"[\r\n]+",
+                text,
+            )
             if line.strip()
         ]
+
+        # Falls alles in einer Zeile steht:
+        if len(lines) == 1:
+
+            lines = [
+                part.strip()
+                for part in re.split(
+                    r"\s+(?=(?:ID|Kills|Alliance|Kingdom)\s*:)",
+                    lines[0],
+                    flags=re.IGNORECASE,
+                )
+                if part.strip()
+            ]
 
         detected_id = None
         detected_name = None
         detected_alliance = None
         detected_kingdom = None
 
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
         # ID
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
 
-        for line in lines:
+        id_index = None
+
+        for index, line in enumerate(lines):
+
             match = self.id_pattern.search(line)
 
             if match:
+
                 detected_id = match.group(1)
-
-                # Name steht im Kingshot-Profil normalerweise
-                # direkt über der ID.
-                index = lines.index(line)
-
-                if index > 0:
-                    candidate = lines[index - 1].strip()
-
-                    # [PAX]Newlifeyv13 -> Newlifeyv13
-                    candidate = self.tag_pattern.sub("", candidate).strip()
-
-                    # Nur sinnvolle Namen übernehmen.
-                    if (
-                        candidate
-                        and not re.search(
-                            r"\b(?:ID|Kills|Alliance|Kingdom|Power)\b",
-                            candidate,
-                            re.IGNORECASE
-                        )
-                    ):
-                        detected_name = candidate
+                id_index = index
 
                 break
 
-        # -----------------------------------------------------
-        # KINGDOM
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
+        # Name + Alliance aus [PAX]Name
+        # ---------------------------------------------------------
 
-        for line in lines:
-            match = self.kingdom_pattern.search(line)
+        if id_index is not None:
 
-            if match:
-                detected_kingdom = match.group(1)
-                break
+            # Normalerweise befindet sich
+            # [PAX]Newlifeyv13 direkt über ID.
+            for index in range(
+                max(0, id_index - 3),
+                id_index,
+            ):
 
-        # -----------------------------------------------------
-        # ALLIANCE
-        # -----------------------------------------------------
+                line = lines[index]
 
-        for line in lines:
-            match = self.alliance_pattern.search(line)
-
-            if match:
-                detected_alliance = match.group(1).strip()
-
-                # OCR kann gelegentlich # oder [] anhängen.
-                detected_alliance = detected_alliance.strip(
-                    "[](){}# :,-"
-                )
-
-                break
-
-        # -----------------------------------------------------
-        # FALLBACK: Alliance aus [PAX] extrahieren
-        # -----------------------------------------------------
-
-        if not detected_alliance:
-            for line in lines:
-                match = re.match(
-                    r"\s*\[([A-Za-z0-9]{1,10})\]",
+                match = self.profile_name_pattern.match(
                     line
                 )
 
                 if match:
-                    detected_alliance = match.group(1)
+
+                    if not detected_alliance:
+                        detected_alliance = (
+                            match.group(1).strip()
+                        )
+
+                    detected_name = (
+                        match.group(2).strip()
+                    )
+
                     break
 
-        # -----------------------------------------------------
-        # FALLBACK: Name suchen
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
+        # Alliance: PAX
+        # ---------------------------------------------------------
+
+        for line in lines:
+
+            match = self.alliance_pattern.search(
+                line
+            )
+
+            if match:
+
+                alliance = match.group(1).strip()
+
+                alliance = alliance.strip(
+                    "[](){}#,:; "
+                )
+
+                if alliance:
+                    detected_alliance = alliance
+
+                break
+
+        # ---------------------------------------------------------
+        # Kingdom: #856
+        # ---------------------------------------------------------
+
+        for line in lines:
+
+            match = self.kingdom_pattern.search(
+                line
+            )
+
+            if match:
+
+                detected_kingdom = (
+                    match.group(1)
+                )
+
+                break
+
+        # ---------------------------------------------------------
+        # Falls [PAX]Name nicht erkannt wurde
+        # ---------------------------------------------------------
 
         if not detected_name:
 
             for line in lines:
 
-                if re.search(
-                    r"\b(?:ID|Kills|Alliance|Kingdom|Power)\b",
-                    line,
-                    re.IGNORECASE
-                ):
-                    continue
-
-                match = re.match(
-                    r"\s*\[([^\]]+)\]\s*(.+)",
+                match = self.profile_name_pattern.match(
                     line
                 )
 
                 if match:
-                    detected_name = match.group(2).strip()
 
-                    if not detected_alliance:
-                        detected_alliance = match.group(1).strip()
+                    detected_alliance = (
+                        detected_alliance
+                        or match.group(1).strip()
+                    )
+
+                    detected_name = (
+                        match.group(2).strip()
+                    )
 
                     break
 
-        # -----------------------------------------------------
-        # VALIDIERUNG
-        # -----------------------------------------------------
+        # ---------------------------------------------------------
+        # Validierung
+        # ---------------------------------------------------------
 
         if not detected_id:
             return None
@@ -282,8 +374,18 @@ class ProfileOCR(commands.Cog):
         if not detected_kingdom:
             detected_kingdom = "Unbekannt"
 
-        # CSV nicht durch Kommas im Spielernamen kaputtmachen.
-        detected_name = detected_name.replace(",", " ")
+        # CSV-Sicherheit
+        detected_name = (
+            detected_name
+            .replace(",", " ")
+            .strip()
+        )
+
+        detected_alliance = (
+            detected_alliance
+            .replace(",", " ")
+            .strip()
+        )
 
         return {
             "id": detected_id,
@@ -292,40 +394,61 @@ class ProfileOCR(commands.Cog):
             "kingdom": detected_kingdom,
         }
 
-    # ---------------------------------------------------------
-    # DISCORD MESSAGE HANDLER
-    # ---------------------------------------------------------
+    # =============================================================
+    # MESSAGE LISTENER
+    # =============================================================
 
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
+    async def on_message(
+        self,
+        message: discord.Message,
+    ):
 
+        # Eigene Nachrichten ignorieren
         if message.author.bot:
             return
 
+        # Keine Anhänge
         if not message.attachments:
             return
 
-        configured_channel = self.get_configured_channel_id()
+        # Nur konfigurierten Profil-Kanal überwachen
+        channel_id = self.get_configured_channel_id()
 
-        if not configured_channel:
+        if not channel_id:
             return
 
-        if message.channel.id != configured_channel:
+        if message.channel.id != channel_id:
             return
 
-        # Nur Bilder
+        # ---------------------------------------------------------
+        # Erstes Bild suchen
+        # ---------------------------------------------------------
+
         image = None
 
         for attachment in message.attachments:
 
-            content_type = attachment.content_type or ""
+            content_type = (
+                attachment.content_type or ""
+            ).lower()
+
+            filename = (
+                attachment.filename or ""
+            ).lower()
 
             if (
                 content_type.startswith("image/")
-                or attachment.filename.lower().endswith(
-                    (".png", ".jpg", ".jpeg", ".webp")
+                or filename.endswith(
+                    (
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".webp",
+                    )
                 )
             ):
+
                 image = attachment
                 break
 
@@ -333,24 +456,29 @@ class ProfileOCR(commands.Cog):
             return
 
         status = await message.channel.send(
-            "🔎 **Profil-Screenshot wird analysiert...**"
+            "🔎 **Governor-Profil wird analysiert...**"
         )
 
         try:
 
+            # -----------------------------------------------------
+            # Bild laden
+            # -----------------------------------------------------
+
             image_bytes = await image.read()
 
-            # -------------------------------------------------
-            # Zentrale OCR des Bots verwenden
-            # -------------------------------------------------
+            # -----------------------------------------------------
+            # ZENTRALE OCR VON BEAR_TRACK VERWENDEN
+            # -----------------------------------------------------
 
             extracted_text = await bear_track.ocr_bytes(
                 image_bytes,
-                lang=bear_track.DEFAULT_OCR_LANG
+                lang=bear_track.DEFAULT_OCR_LANG,
             )
 
             logger.info(
-                f"ProfileOCR raw OCR: {extracted_text!r}"
+                "ProfileOCR raw text: %r",
+                extracted_text,
             )
 
             if not extracted_text:
@@ -358,116 +486,73 @@ class ProfileOCR(commands.Cog):
                 await status.edit(
                     content=(
                         "❌ **OCR konnte keinen Text erkennen.**\n"
-                        "Bitte einen schärferen Screenshot hochladen."
+                        "Bitte einen klaren Kingshot-Profil-Screenshot "
+                        "hochladen."
                     )
                 )
+
                 return
 
-            # -------------------------------------------------
-            # Profil parsen
-            # -------------------------------------------------
+            # -----------------------------------------------------
+            # Profil analysieren
+            # -----------------------------------------------------
 
-            profile = self.parse_profile(extracted_text)
+            profile = self.parse_profile(
+                extracted_text
+            )
 
             if not profile:
 
                 await status.edit(
                     content=(
-                        "❌ **Spieler-ID konnte nicht erkannt werden.**\n\n"
-                        f"```text\n{extracted_text[:1500]}\n```"
+                        "❌ **Governor-Profil konnte nicht erkannt werden.**\n\n"
+                        "OCR-Ausgabe:\n"
+                        "```text\n"
+                        f"{extracted_text[:1500]}\n"
+                        "```"
                     )
                 )
+
                 return
 
-            player_id = profile["id"]
-            name = profile["name"]
-            alliance = profile["alliance"]
-            kingdom = profile["kingdom"]
-
-            # -------------------------------------------------
-            # Datenbank aktualisieren
-            # -------------------------------------------------
-
-            try:
-
-                with sqlite3.connect(
-                    "db/users.sqlite",
-                    timeout=30
-                ) as conn:
-
-                    conn.execute(
-                        """
-                        INSERT INTO users
-                        (
-                            fid,
-                            nickname,
-                            kid,
-                            alliance
-                        )
-                        VALUES (?, ?, ?, ?)
-
-                        ON CONFLICT(fid)
-                        DO UPDATE SET
-
-                            nickname = excluded.nickname,
-
-                            kid = CASE
-                                WHEN excluded.kid IS NOT NULL
-                                THEN excluded.kid
-                                ELSE users.kid
-                            END,
-
-                            alliance = CASE
-                                WHEN excluded.alliance IS NOT NULL
-                                THEN excluded.alliance
-                                ELSE users.alliance
-                            END
-                        """,
-                        (
-                            int(player_id),
-                            name,
-                            (
-                                int(kingdom)
-                                if kingdom.isdigit()
-                                else None
-                            ),
-                            alliance
-                        )
-                    )
-
-                    conn.commit()
-
-            except Exception:
-                logger.exception(
-                    "ProfileOCR: database update failed"
-                )
-
-            # -------------------------------------------------
-            # Gewünschtes Format
-            # -------------------------------------------------
+            # -----------------------------------------------------
+            # Ergebnis
+            # -----------------------------------------------------
 
             result_string = (
-                f"{player_id},"
-                f"{name},"
-                f"{alliance},"
-                f"{kingdom}"
+                f"{profile['id']},"
+                f"{profile['name']},"
+                f"{profile['alliance']},"
+                f"{profile['kingdom']}"
             )
 
-            # Log
+            # -----------------------------------------------------
+            # Nur Log schreiben
+            # Noch KEINE Datenbankänderung!
+            # -----------------------------------------------------
+
             with open(
                 self.log_file_path,
                 "a",
-                encoding="utf-8"
+                encoding="utf-8",
             ) as f:
-                f.write(result_string + "\n")
 
-            # -------------------------------------------------
-            # Discord Ergebnis
-            # -------------------------------------------------
+                f.write(
+                    result_string + "\n"
+                )
+
+            logger.info(
+                "ProfileOCR result: %s",
+                result_string,
+            )
+
+            # -----------------------------------------------------
+            # Discord
+            # -----------------------------------------------------
 
             await status.edit(
                 content=(
-                    "✅ **Profil erkannt**\n\n"
+                    "✅ **Governor-Profil erkannt**\n\n"
                     "```text\n"
                     "ID,Name,Alliance,Kingdom\n"
                     f"{result_string}\n"
@@ -475,14 +560,10 @@ class ProfileOCR(commands.Cog):
                 )
             )
 
-            logger.info(
-                f"ProfileOCR result: {result_string}"
-            )
-
         except Exception as e:
 
             logger.exception(
-                "ProfileOCR: image processing failed"
+                "ProfileOCR failed"
             )
 
             await status.edit(
