@@ -20,6 +20,7 @@ from discord.ext import commands
 from discord import app_commands
 
 from . import bear_track
+from .alliance_member_edit import apply_member_edit, enqueue_catchups
 
 logger = logging.getLogger("bot")
 
@@ -130,6 +131,53 @@ class ProfileOCR(commands.Cog):
             self._guild_locks[guild_id] = asyncio.Lock()
         return self._guild_locks[guild_id]
 
+    @staticmethod
+    def _sync_existing_member(profile):
+        """
+        Synchronisiert ein erkanntes Governor-Profil nur mit einem
+        bereits vorhandenen Benutzer.
+
+        Geändert werden ausschließlich:
+        - nickname
+        - kid (Kingdom)
+
+        Alliance, Furnace-Level, Power, Discord-Daten usw.
+        bleiben unverändert.
+        """
+
+        fid = int(profile["id"])
+        nickname = profile["name"]
+        kid = int(profile["kingdom"])
+
+        with sqlite3.connect(
+            "db/users.sqlite",
+            timeout=30.0,
+        ) as conn:
+
+            row = conn.execute(
+                """
+                SELECT nickname, kid
+                FROM users
+                WHERE fid = ?
+                """,
+                (fid,),
+            ).fetchone()
+
+        if row is None:
+            return "not_found", False
+
+        changed = apply_member_edit(
+            fid,
+            nickname=nickname,
+            kid=kid,
+            alliance_id=None,
+        )
+
+        if changed:
+            return "updated", ("state" in changed)
+
+        return "unchanged", False
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         try:
@@ -175,6 +223,12 @@ class ProfileOCR(commands.Cog):
             async with self._guild_lock(message.guild.id):
                 successes = []
                 failures = []
+
+                db_updated = 0
+                db_unchanged = 0
+                db_not_found = 0
+                state_fids = []
+
                 for image in images:
                     try:
                         logger.warning("ProfileOCR DEBUG: reading image %s", image.filename)
@@ -193,6 +247,47 @@ class ProfileOCR(commands.Cog):
                         result = f"{profile['id']},{profile['name']},,{profile['kingdom']}"
                         successes.append(result)
                         logger.warning("ProfileOCR result: %s", result)
+
+                        # Nur sicher erkannte Profile mit der bestehenden
+                        # Mitgliederdatenbank synchronisieren.
+                        if (
+                            profile["name"] != "Unbekannt"
+                            and profile["kingdom"] != "Unbekannt"
+                        ):
+                            try:
+                                sync_status, state_changed = (
+                                    await asyncio.to_thread(
+                                        self._sync_existing_member,
+                                        profile,
+                                    )
+                                )
+
+                                if sync_status == "updated":
+                                    db_updated += 1
+
+                                elif sync_status == "unchanged":
+                                    db_unchanged += 1
+
+                                elif sync_status == "not_found":
+                                    db_not_found += 1
+
+                                if state_changed:
+                                    state_fids.append(
+                                        int(profile["id"])
+                                    )
+
+                            except Exception as db_error:
+                                logger.exception(
+                                    "ProfileOCR DB sync failed for %s",
+                                    profile["id"],
+                                )
+
+                                failures.append(
+                                    f"{image.filename}: "
+                                    f"Profil erkannt, aber "
+                                    f"DB-Update fehlgeschlagen "
+                                    f"({db_error})"
+                                )
                     except Exception as e:
                         logger.exception("ProfileOCR failed for %s", image.filename)
                         failures.append(f"{image.filename}: {e}")
@@ -202,9 +297,40 @@ class ProfileOCR(commands.Cog):
                         for result in successes:
                             f.write(result + "\n")
 
+                # Wenn sich das Kingdom eines bestehenden Spielers
+                # geändert hat, bestehenden Catch-up-Mechanismus verwenden.
+                caught = (
+                    enqueue_catchups(self.bot, state_fids)
+                    if state_fids
+                    else 0
+                )
+
                 parts = []
+
                 if successes:
-                    parts.append(f"✅ **{len(successes)}/{len(images)} Governor-Profile erkannt**\n\n```text\nID,Name,,Kingdom\n" + "\n".join(successes) + "\n```")
+                    parts.append(
+                        f"✅ **{len(successes)}/{len(images)} "
+                        f"Governor-Profile erkannt**\n\n"
+                        f"```text\n"
+                        f"ID,Name,,Kingdom\n"
+                        + "\n".join(successes)
+                        + "\n```"
+                    )
+
+                    db_text = (
+                        "💾 **Mitgliederdatenbank**\n"
+                        f"🔄 Aktualisiert: **{db_updated}**\n"
+                        f"➖ Unverändert: **{db_unchanged}**\n"
+                        f"❓ Nicht vorhanden: **{db_not_found}**"
+                    )
+
+                    if caught:
+                        db_text += (
+                            f"\n🎁 Gift-Code Catch-up: **{caught}**"
+                        )
+
+                    parts.append(db_text)
+
                 if failures:
                     parts.append("⚠️ **Nicht erkannt:**\n" + "\n".join(f"• {x}" for x in failures[:10]))
                 await status.edit(content="\n\n".join(parts) or "❌ Kein Governor-Profil erkannt.")
