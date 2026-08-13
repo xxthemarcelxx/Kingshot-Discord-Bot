@@ -1319,13 +1319,23 @@ if __name__ == "__main__":
     init(autoreset=True)
 
     token_file = "bot_token.txt"
-    if not os.path.exists(token_file):
-        bot_token = input("Enter the bot token: ")
-        with open(token_file, "w") as f:
-            f.write(bot_token)
-    else:
-        with open(token_file, "r") as f:
-            bot_token = f.read().strip()
+
+    # Docker / environment variable has priority.
+    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+
+    if not bot_token:
+        if os.path.exists(token_file):
+            with open(token_file, "r") as f:
+                bot_token = f.read().strip()
+        else:
+            bot_token = input("Enter the bot token: ").strip()
+            with open(token_file, "w") as f:
+                f.write(bot_token)
+
+    if not bot_token:
+        raise RuntimeError(
+            "Discord bot token missing. Set DISCORD_BOT_TOKEN."
+        )
 
     if not os.path.exists("db"):
         os.makedirs("db")
@@ -1674,7 +1684,8 @@ if __name__ == "__main__":
             # Sync once per process — on_ready re-fires on reconnect; commands are static.
             if not getattr(bot, '_commands_synced', False):
                 startup.phase_start("Syncing slash commands with Discord")
-                await bot.tree.sync()
+                synced = await bot.tree.sync()
+                print("SYNCED COMMANDS:", [cmd.name for cmd in synced])
                 bot._commands_synced = True
                 startup.phase_ok("Slash commands synced with Discord")
 
